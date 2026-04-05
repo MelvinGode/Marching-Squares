@@ -1,4 +1,6 @@
 import numpy as np
+import torch
+import matplotlib.pyplot as plt
 
 
 top = [0.5, 1]
@@ -17,7 +19,7 @@ diag_botright = [bottom, right]
 LOOKUP = [
     [ # 0
         [ # 0 0
-            [[], [diag_topright]], # 0 0 0
+            [[[]], [diag_topright]], # 0 0 0
             [[diag_topleft], [horizontal]] # 0 0 1
         ],
         [ # 0 1
@@ -32,10 +34,21 @@ LOOKUP = [
         ],
         [ # 1 1
             [[horizontal], [diag_topleft]], # 1 1 0
-            [[diag_topright], []] # 1 1 1
+            [[diag_topright], [[]]] # 1 1 1
         ]
     ]
 ]
+
+LOOKUP_tensor = torch.zeros(2, 2, 2, 2, 2, 2, dtype=torch.long)
+LOOKUP_tensor[tuple(torch.tensor([[1,1,0,0, 0], [0,0,1,1, 0]]).T)] = torch.tensor([1, 3]) # horizontal
+LOOKUP_tensor[tuple(torch.tensor([[0,1,0,1, 0], [1,0,1,0, 0]]).T)] = torch.tensor([0, 2]) # vertical
+LOOKUP_tensor[tuple(torch.tensor([[1,0,0,0, 0], [0,1,1,1, 0]]).T)] = torch.tensor([2, 3]) # diag_botleft
+LOOKUP_tensor[tuple(torch.tensor([[0,1,0,0, 0], [1,0,1,1, 0]]).T)] = torch.tensor([1, 2]) # diag_botright
+LOOKUP_tensor[tuple(torch.tensor([[0,0,0,1, 0], [1,1,1,0, 0]]).T)] = torch.tensor([0, 1]) # diag_topright
+LOOKUP_tensor[tuple(torch.tensor([[0,0,1,0, 0], [1,1,0,1, 0]]).T)] = torch.tensor([0, 3]) # diag_topleft
+# LOOKUP_tensor[tuple(torch.tensor([[0,1,1,0], [1,0,0,1]]).T)] = torch.tensor([[1, 2], [0, 3]]) # diag_botright, diag_topleft
+# LOOKUP_tensor[tuple(torch.tensor([[0,1,1,0], [1,0,0,1]]).T)] = torch.tensor([[2, 3], [0, 1]]) # diag_botleft, diag_topright
+
 
 def get_interpolated_linepoints(anchor_binary:np.ndarray, anchor_values, anchor_abs_values):
     top[0] = anchor_abs_values[2]/abs(anchor_values[3] - anchor_values[2])
@@ -45,29 +58,77 @@ def get_interpolated_linepoints(anchor_binary:np.ndarray, anchor_values, anchor_
 
     return LOOKUP[anchor_binary[0]][anchor_binary[1]][anchor_binary[2]][anchor_binary[3]]
 
-def get_linepoints(anchor_binary:np.ndarray, anchor_values:list[float]=None):
-    # TODO replace with an actual lookup table
-    nb_on = anchor_binary.sum()
-    if nb_on==0 or nb_on==4 : return []
-    if nb_on==1 or nb_on==3:
-        if nb_on==3 : anchor_binary = 1-anchor_binary # unify 1on and 3on cases so that we're always looking for the only 1 value
-        if anchor_binary[0]: return [[[0, 0.5], [0.5, 0]]]
-        elif anchor_binary[1]: return [[[0.5, 0], [1, 0.5]]]
-        elif anchor_binary[2]: return [[[0, 0.5], [0.5, 1]]]
-        elif anchor_binary[3]: return [[[0.5, 1], [1, 0.5]]]
 
-    elif nb_on==2:
-        if anchor_binary[0] == anchor_binary[2] : 
-            return [[[0.5, 1], [0.5, 0]]]
-        elif anchor_binary[0] == anchor_binary[1] : 
-            return [[[0, 0.5], [1, 0.5]]]
-        elif anchor_binary[0] == 1 and anchor_binary[2] == 1 : 
-            return [[[0, 0.5], [0.5, 1]], [[0.5, 0], [1, 0.5]]]
-        elif anchor_binary[0] == 0 and anchor_binary[2] == 0 : 
-            return [[[0.5, 1], [1, 0.5]], [[0, 0.5], [0.5, 0]]]
+def march_squares_gaussian_mixture(means, covariances, x_interval:float, y_interval:float, bounds:list, thresholds:list, gaussian_coeffs=None) -> list:
+    nb_gaussians = len(means)
 
-    assert False, "this case should not happen"
-    #TODO weighted case
+    means=torch.tensor(means).to("cuda")
+    if gaussian_coeffs is None:
+        gaussian_coeffs = torch.rand(nb_gaussians)/2
+        gaussian_coeffs/= gaussian_coeffs.sum()
+        gaussian_coeffs = gaussian_coeffs.to("cuda")
+    else : gaussian_coeffs = torch.tensor(gaussian_coeffs).to("cuda")
+
+    thresholds = torch.tensor(thresholds).to("cuda")
+    nb_thresholds = len(thresholds)
+
+    sigma_determinants = [_ for _ in range(nb_gaussians)]
+    inverse_sigmas = [_ for _ in range(nb_gaussians)]
+    for i in range(nb_gaussians):
+        sigma_determinants[i] = np.linalg.det(covariances[i])
+        inverse_sigmas[i] = np.linalg.inv(covariances[i])
+    sigma_determinants = torch.tensor(sigma_determinants).to("cuda")
+    inverse_sigmas = torch.tensor(np.array(inverse_sigmas)).to("cuda")
+
+    x_range = bounds[1][0] - bounds[0][0]
+    y_range = bounds[1][1] - bounds[0][1]
+    nb_x = int(x_range //x_interval)
+    nb_y = int(y_range //y_interval)
+    interval_vector = np.array((x_interval, y_interval))
+
+    input_grid = np.empty((nb_x, nb_y, 2))
+    input_grid[np.arange(nb_x), :, 0] = np.linspace(bounds[0][0], bounds[1][0], nb_x)[:, None]
+    input_grid[:, np.arange(nb_y), 1] = np.linspace(bounds[0][1], bounds[1][1], nb_y)[None, :]
+    input_grid = torch.tensor(input_grid).to("cuda")
+
+    diffs = input_grid.unsqueeze(2) - means # shape [nb_x, nb_y, nb_gaussians, 2]
+
+    output_grid = torch.sum(
+        1/torch.sqrt(2*np.pi*sigma_determinants) * torch.exp(-0.5* ((diffs.unsqueeze(-2)@inverse_sigmas)@diffs.unsqueeze(-1)).squeeze()) * gaussian_coeffs
+    , dim=2)
+
+    binary_grid = output_grid.unsqueeze(2) > thresholds
+    binary_indexes = torch.stack([
+                                    binary_grid[:-1, :-1], 
+                                    binary_grid[1:,  :-1], 
+                                    binary_grid[:-1,  1:], 
+                                    binary_grid[1:,   1:]
+                                ], dim=0).to(torch.long)
+
+    interpolation_coords = torch.stack([
+        torch.cat([(thresholds - output_grid[:-1, :].unsqueeze(-1)) / (output_grid[1:, :] - output_grid[:-1, :]).unsqueeze(-1), torch.zeros(1, nb_y, nb_thresholds).to("cuda")], dim=0),
+        torch.cat([(thresholds - output_grid[:, :-1].unsqueeze(-1)) / (output_grid[:, 1:] - output_grid[:, :-1]).unsqueeze(-1), torch.zeros(nb_x, 1, nb_thresholds).to("cuda")], dim=1)
+    ], dim=-1)
+    interpolation_coords  = interpolation_coords * torch.tensor(interval_vector).to("cuda") + input_grid.unsqueeze(-2)
+
+    tmp = input_grid.unsqueeze(-2).repeat(1, 1, nb_thresholds, 1)
+    interpolated_points = torch.stack([
+        torch.stack([interpolation_coords[:-1, 1:, :, 0], tmp[:-1, 1:, :, 1]], dim=-1), # top
+        torch.stack([tmp[1:, :-1, :, 0], interpolation_coords[1:, :-1, :, 1]], dim=-1), # right
+        torch.stack([interpolation_coords[:-1, :-1, :, 0], tmp[:-1, :-1, :, 1]], dim=-1), # bot
+        torch.stack([tmp[:-1, :-1, :, 0], interpolation_coords[:-1, :-1, :, 1]], dim=-1) # left
+    ], dim=-2) # shape [nb_x, nb_y, nb_thresholds, 4, 2]
+
+    linepoint_indexes = LOOKUP_tensor.to("cuda")[tuple(binary_indexes)].to(torch.long)
+    mask = torch.any(linepoint_indexes != 0, dim=(-1))
+    
+    line_fulltensor = torch.take_along_dim(interpolated_points.unsqueeze(4), linepoint_indexes.unsqueeze(-1), 3)
+    line_tensor = line_fulltensor.transpose(0,2)[mask.transpose(0,2)].view(-1, 2, 2)
+    linelist = line_tensor.cpu().numpy()
+
+    level_count = torch.sum(mask, dim=(0,1,3)).cpu().numpy()
+
+    return linelist, level_count
 
 
 
@@ -110,6 +171,3 @@ def march_squares(f:callable, x_interval:int, y_interval, bounds:list, threshold
         linelists.append(linelist)
 
     return linelists
-
-# a = np.arange(9).reshape((3,3))
-# print(a[tuple(np.array([[0,1], [2,2]]).T)])
