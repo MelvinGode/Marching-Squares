@@ -10,3 +10,5 @@ The main output is an animated MP4/GIF where the field smoothly morphs over time
 
 ## Stack
 Python · NumPy · PyTorch · matplotlib · imageio · moviepy
+
+Coded by hand with occasional LLM tech support interventions for video libraries.
